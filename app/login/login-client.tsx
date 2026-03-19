@@ -62,6 +62,20 @@ export default function LoginClient() {
     }
   }
 
+  async function syncJwtCookie() {
+    try {
+      const account = getAccount();
+      const jwt = await account.createJWT();
+      await fetch("/api/auth/jwt", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jwt: jwt.jwt }),
+      });
+    } catch {
+      // ignore
+    }
+  }
+
   const onSubmit = handleSubmit((values) => {
     setFormError(null);
     setShowLogout(false);
@@ -81,15 +95,25 @@ export default function LoginClient() {
       void (async () => {
         const account = getAccount();
 
-        // If a session is already active, Appwrite blocks creating a new one.
-        // Sign out first so the user can switch accounts.
+        // Create a session; only sign out first if Appwrite blocks due to an active session.
         try {
-          await account.deleteSession("current");
-        } catch {
-          // ignore
-        }
+          await account.createEmailPasswordSession(parsed.data.email, parsed.data.password);
+        } catch (error) {
+          const message = getErrorMessage(error);
+          const isActiveSessionError = /session is active/i.test(message) || /prohibited/i.test(message);
 
-        await account.createEmailPasswordSession(parsed.data.email, parsed.data.password);
+          if (!isActiveSessionError) {
+            throw error;
+          }
+
+          try {
+            await account.deleteSession("current");
+          } catch {
+            // ignore
+          }
+
+          await account.createEmailPasswordSession(parsed.data.email, parsed.data.password);
+        }
 
         // Ensure Appwrite updates cookieFallback before we sync it.
         try {
@@ -99,6 +123,7 @@ export default function LoginClient() {
         }
 
         await syncFallbackCookie();
+        await syncJwtCookie();
 
         const res = await fetch("/api/admin/whoami", { method: "GET" });
         if (res.ok) {
@@ -116,6 +141,7 @@ export default function LoginClient() {
         try {
           window.localStorage?.removeItem("cookieFallback");
           await fetch("/api/auth/fallback", { method: "DELETE" });
+          await fetch("/api/auth/jwt", { method: "DELETE" });
         } catch {
           // ignore
         }
@@ -139,6 +165,7 @@ export default function LoginClient() {
         // If Appwrite is using localStorage sessions, copy cookieFallback into a
         // first-party cookie so middleware can authenticate.
         await syncFallbackCookie();
+        await syncJwtCookie();
 
         const res = await fetch("/api/admin/whoami", { method: "GET" });
         if (cancelled) return;
@@ -207,6 +234,7 @@ export default function LoginClient() {
                       try {
                         window.localStorage?.removeItem("cookieFallback");
                         void fetch("/api/auth/fallback", { method: "DELETE" });
+                        void fetch("/api/auth/jwt", { method: "DELETE" });
                       } catch {
                         // ignore
                       }

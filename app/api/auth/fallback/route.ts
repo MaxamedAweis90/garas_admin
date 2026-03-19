@@ -2,16 +2,24 @@ import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 const COOKIE_NAME = "garas_aw_cookie_fallback";
 
-function base64UrlDecode(value: string) {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized + "===".slice((normalized.length + 3) % 4);
-  return Buffer.from(padded, "base64").toString("utf8");
-}
-
 function base64UrlEncode(value: string) {
+  if (typeof (globalThis as any).btoa === "function") {
+    const bytes = new TextEncoder().encode(value);
+    let binary = "";
+    for (const byte of bytes) {
+      binary += String.fromCharCode(byte);
+    }
+    return (globalThis as any)
+      .btoa(binary)
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+  }
+
   return Buffer.from(value, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
