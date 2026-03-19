@@ -1,0 +1,11 @@
+Subject: Invitation to {{team}} Team at {{project}}
+
+Hello {{user}},
+
+{{owner}} invited you to join the Admin team "{{team}}" on {{project}}.
+
+Accept invitation: {{redirect}}
+
+If you weren’t expecting this invite, you can ignore this email.
+
+— {{project}}
