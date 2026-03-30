@@ -59,7 +59,7 @@ async function getRequestOrigin() {
   const proto = forwardedProto || (process.env.NODE_ENV === "production" ? "https" : "http");
 
   const forwardedHost = h.get("x-forwarded-host");
-  const host = forwardedHost || h.get("host") || "localhost:3001";
+  const host = forwardedHost || h.get("host") || "localhost:3000";
 
   return `${proto}://${host}`;
 }

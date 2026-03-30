@@ -5,6 +5,8 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 type AccountResponse = { $id: string; email?: string; name?: string };
+type TeamListResponse = { teams: Array<{ $id: string; name: string }>; total: number };
+type MembershipListResponse = { memberships: Array<{ $id: string; userId: string; confirm?: boolean; joined?: string | null }>; total: number };
 
 const FALLBACK_COOKIE_NAME = "garas_aw_cookie_fallback";
 const JWT_COOKIE_NAME = "garas_aw_jwt";
@@ -27,6 +29,42 @@ function normalizeEnv(value: string | undefined) {
   return (value ?? "").trim().replace(/^['\"]|['\"]$/g, "");
 }
 
+function getAdminTeamName() {
+  return normalizeEnv(process.env.ADMIN_TEAM_NAME) || "Admin";
+}
+
+function getAdminTeamIdFromEnv() {
+  return normalizeEnv(process.env.ADMIN_TEAM_ID) || null;
+}
+
+function getAdminEmails() {
+  const set = new Set<string>();
+  const mainAdmin = normalizeEnv(process.env.MAIN_ADMIN_EMAIL);
+  const extraAdmins = normalizeEnv(process.env.ADMIN_EMAILS);
+
+  if (mainAdmin) {
+    set.add(mainAdmin.toLowerCase());
+  }
+
+  if (extraAdmins) {
+    for (const item of extraAdmins.split(",")) {
+      const email = item.trim().toLowerCase();
+      if (email) {
+        set.add(email);
+      }
+    }
+  }
+
+  return set;
+}
+
+function isAdminEmail(email?: string | null) {
+  if (!email) {
+    return false;
+  }
+  return getAdminEmails().has(email.toLowerCase());
+}
+
 function getAppwriteRestBase() {
   const endpoint = normalizeEnv(process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT);
   if (!endpoint) {
@@ -42,6 +80,14 @@ function getProjectId() {
     throw new Error("NEXT_PUBLIC_APPWRITE_PROJECT_ID missing");
   }
   return projectId;
+}
+
+function getApiKey() {
+  const apiKey = normalizeEnv(process.env.APPWRITE_API_KEY);
+  if (!apiKey) {
+    throw new Error("APPWRITE_API_KEY missing");
+  }
+  return apiKey;
 }
 
 async function appwriteFetch<T>(path: string, init: RequestInit) {
@@ -72,6 +118,83 @@ async function appwriteFetch<T>(path: string, init: RequestInit) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return { ok: false as const, status: 502, message };
   }
+}
+
+async function appwriteApiKeyFetch<T>(path: string, init: RequestInit) {
+  const base = getAppwriteRestBase();
+  const requestHeaders = new Headers(init.headers);
+  requestHeaders.set("X-Appwrite-Project", getProjectId());
+  requestHeaders.set("X-Appwrite-Key", getApiKey());
+  requestHeaders.set("X-Appwrite-Response-Format", "1.5.0");
+
+  const res = await fetch(base + path, {
+    ...init,
+    headers: requestHeaders,
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { ok: false as const, status: res.status, message: text.slice(0, 200) };
+  }
+
+  return { ok: true as const, status: res.status, data: (await res.json()) as T };
+}
+
+async function getAdminTeamId() {
+  const teamIdFromEnv = getAdminTeamIdFromEnv();
+  if (teamIdFromEnv) {
+    return { ok: true as const, id: teamIdFromEnv };
+  }
+
+  const adminTeamName = getAdminTeamName();
+  const teamsResult = await appwriteApiKeyFetch<TeamListResponse>(`/teams?search=${encodeURIComponent(adminTeamName)}`, {
+    method: "GET",
+  });
+
+  if (!teamsResult.ok) {
+    return { ok: false as const, status: teamsResult.status };
+  }
+
+  const team = teamsResult.data.teams.find((item) => item.name === adminTeamName) ?? null;
+  if (!team) {
+    return { ok: true as const, id: null as string | null };
+  }
+
+  return { ok: true as const, id: team.$id };
+}
+
+async function isAdminTeamMember(userId: string) {
+  const teamResult = await getAdminTeamId();
+  if (!teamResult.ok) {
+    return { ok: false as const, status: teamResult.status };
+  }
+
+  if (!teamResult.id) {
+    return { ok: true as const, isAdmin: false };
+  }
+
+  const queries = [
+    `equal("userId", ["${userId}"])`,
+    "limit(25)",
+  ].map((q) => `queries[]=${encodeURIComponent(q)}`);
+
+  const memberships = await appwriteApiKeyFetch<MembershipListResponse>(`/teams/${teamResult.id}/memberships?${queries.join("&")}`, {
+    method: "GET",
+  });
+
+  if (!memberships.ok) {
+    return { ok: false as const, status: memberships.status };
+  }
+
+  const isAdmin = memberships.data.memberships.some((membership) => {
+    if (membership.userId !== userId) {
+      return false;
+    }
+    return membership.confirm === true || Boolean(membership.joined);
+  });
+
+  return { ok: true as const, isAdmin };
 }
 
 export async function GET() {
@@ -108,14 +231,32 @@ export async function GET() {
       return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
     }
 
-    const mainAdminEmail = normalizeEnv(process.env.MAIN_ADMIN_EMAIL) || "mohamedaweis.dev@gmail.com";
+    const mainAdminEmail = normalizeEnv(process.env.MAIN_ADMIN_EMAIL);
     const email = result.data.email ?? "";
+    const isMainAdmin = Boolean(mainAdminEmail) && email.toLowerCase() === mainAdminEmail.toLowerCase();
+    const isAllowedByEmail = isAdminEmail(email);
+
+    let isAllowedByTeam = false;
+    if (!isAllowedByEmail) {
+      const membership = await isAdminTeamMember(result.data.$id);
+      if (!membership.ok) {
+        if (membership.status >= 500) {
+          return NextResponse.json({ error: "appwrite_unreachable" }, { status: 500 });
+        }
+        return NextResponse.json({ error: "forbidden" }, { status: 403 });
+      }
+      isAllowedByTeam = membership.isAdmin;
+    }
+
+    if (!isAllowedByEmail && !isAllowedByTeam) {
+      return NextResponse.json({ error: "forbidden" }, { status: 403 });
+    }
 
     return NextResponse.json({
       userId: result.data.$id,
       email: result.data.email ?? null,
       name: result.data.name ?? null,
-      isMainAdmin: email.toLowerCase() === mainAdminEmail.toLowerCase(),
+      isMainAdmin,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

@@ -1,10 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 type TeamListResponse = { teams: Array<{ $id: string; name: string }>; total: number };
-type MembershipListResponse = { memberships: Array<{ $id: string; userId: string; status: string }>; total: number };
+type MembershipListResponse = { memberships: Array<{ $id: string; userId: string; confirm?: boolean; joined?: string | null }>; total: number };
 type AccountResponse = { $id: string; email?: string; name?: string };
+type AppwriteFetchInit = RequestInit & { apiKeyAuth?: boolean; fallbackCookies?: string };
 
-const ADMIN_TEAM_NAME = "Admin";
 const FALLBACK_COOKIE_NAME = "garas_aw_cookie_fallback";
 const JWT_COOKIE_NAME = "garas_aw_jwt";
 
@@ -12,6 +12,42 @@ let cachedAdminTeamId: { id: string; expiresAtMs: number } | null = null;
 
 function normalizeEnv(value: string | undefined) {
   return (value ?? "").trim().replace(/^['\"]|['\"]$/g, "");
+}
+
+function getAdminTeamName() {
+  return normalizeEnv(process.env.ADMIN_TEAM_NAME) || "Admin";
+}
+
+function getAdminTeamIdFromEnv() {
+  return normalizeEnv(process.env.ADMIN_TEAM_ID) || null;
+}
+
+function getAdminEmails() {
+  const main = normalizeEnv(process.env.MAIN_ADMIN_EMAIL);
+  const extra = normalizeEnv(process.env.ADMIN_EMAILS);
+  const set = new Set<string>();
+
+  if (main) {
+    set.add(main.toLowerCase());
+  }
+
+  if (extra) {
+    for (const part of extra.split(",")) {
+      const email = part.trim().toLowerCase();
+      if (email) {
+        set.add(email);
+      }
+    }
+  }
+
+  return set;
+}
+
+function isAdminEmail(email?: string | null) {
+  if (!email) {
+    return false;
+  }
+  return getAdminEmails().has(email.toLowerCase());
 }
 
 function getAppwriteRestBase() {
@@ -39,7 +75,7 @@ function getApiKey() {
   return apiKey;
 }
 
-async function appwriteFetch<T>(path: string, init: RequestInit & { projectAuth?: boolean; apiKeyAuth?: boolean } = {}) {
+async function appwriteFetch<T>(path: string, init: AppwriteFetchInit = {}) {
   const base = getAppwriteRestBase();
   const projectId = getProjectId();
   if (!base || !projectId) {
@@ -50,9 +86,8 @@ async function appwriteFetch<T>(path: string, init: RequestInit & { projectAuth?
   headers.set("X-Appwrite-Project", projectId);
   headers.set("X-Appwrite-Response-Format", "1.5.0");
 
-  const fallbackCookies = (init as any).fallbackCookies as string | undefined;
-  if (fallbackCookies) {
-    headers.set("X-Fallback-Cookies", fallbackCookies);
+  if (init.fallbackCookies) {
+    headers.set("X-Fallback-Cookies", init.fallbackCookies);
   }
 
   if (init.apiKeyAuth) {
@@ -98,7 +133,7 @@ async function getAccountFromSessionCookie(cookieHeader: string | null, fallback
         ...(jwt ? { "X-Appwrite-JWT": jwt } : {}),
         ...(jwt ? {} : { cookie: cookieHeader ?? "" }),
       },
-      ...(fallbackCookies ? ({ fallbackCookies } as any) : {}),
+      ...(fallbackCookies ? { fallbackCookies } : {}),
     });
     return account;
   } catch {
@@ -107,12 +142,18 @@ async function getAccountFromSessionCookie(cookieHeader: string | null, fallback
 }
 
 async function getAdminTeamId() {
+  const teamIdFromEnv = getAdminTeamIdFromEnv();
+  if (teamIdFromEnv) {
+    return teamIdFromEnv;
+  }
+
   const now = Date.now();
   if (cachedAdminTeamId && cachedAdminTeamId.expiresAtMs > now) {
     return cachedAdminTeamId.id;
   }
 
-  const data = await appwriteFetch<TeamListResponse>(`/teams?search=${encodeURIComponent(ADMIN_TEAM_NAME)}`, {
+  const adminTeamName = getAdminTeamName();
+  const data = await appwriteFetch<TeamListResponse>(`/teams?search=${encodeURIComponent(adminTeamName)}`, {
     method: "GET",
     apiKeyAuth: true,
   });
@@ -121,7 +162,7 @@ async function getAdminTeamId() {
     return null;
   }
 
-  const team = data.teams.find((item) => item.name === ADMIN_TEAM_NAME) ?? null;
+  const team = data.teams.find((item) => item.name === adminTeamName) ?? null;
   if (!team) {
     return null;
   }
@@ -137,10 +178,7 @@ async function isUserInAdminTeam(userId: string) {
   }
 
   // Appwrite REST expects query strings like: equal("userId", ["..."])
-  const queries = [
-    `equal("userId", ["${userId}"])`,
-    "limit(25)",
-  ].map((q) => `queries[]=${encodeURIComponent(q)}`);
+  const queries = [`equal("userId", ["${userId}"])`, "limit(25)"].map((q) => `queries[]=${encodeURIComponent(q)}`);
 
   const data = await appwriteFetch<MembershipListResponse>(`/teams/${teamId}/memberships?${queries.join("&")}`, {
     method: "GET",
@@ -151,12 +189,24 @@ async function isUserInAdminTeam(userId: string) {
     return false;
   }
 
-  return data.memberships.some((membership) => membership.userId === userId && membership.status === "confirmed");
+  return data.memberships.some((membership) => {
+    if (membership.userId !== userId) {
+      return false;
+    }
+
+    // Appwrite membership confirmation is represented by `confirm`/`joined`, not `status`.
+    return membership.confirm === true || Boolean(membership.joined);
+  });
 }
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const url = request.nextUrl;
   const isApiRequest = url.pathname.startsWith("/api/");
+
+  // Let whoami perform its own checks and return explicit diagnostics.
+  if (url.pathname === "/api/admin/whoami") {
+    return NextResponse.next();
+  }
 
   try {
     const cookieHeader = request.headers.get("cookie");
@@ -184,7 +234,11 @@ export async function middleware(request: NextRequest) {
       return NextResponse.redirect(loginUrl);
     }
 
-    const ok = await isUserInAdminTeam(account.$id);
+    // Email allowlist gives a reliable fallback when this app and another app share users
+    // but use different admin-team structures.
+    const isAllowedByEmail = isAdminEmail(account.email);
+    const ok = isAllowedByEmail || (await isUserInAdminTeam(account.$id));
+
     if (!ok) {
       if (isApiRequest) {
         return NextResponse.json({ error: "forbidden" }, { status: 403 });
