@@ -53,6 +53,7 @@ const collections = {
   adminLogs: { id: localEnv.APPWRITE_ADMIN_LOGS_COLLECTION_ID || "admin_logs", name: "Admin_Logs" },
   systemSettings: { id: localEnv.APPWRITE_SYSTEM_SETTINGS_COLLECTION_ID || "system_settings", name: "System_Settings" },
   featureFlags: { id: localEnv.APPWRITE_FEATURE_FLAGS_COLLECTION_ID || "feature_flags", name: "Feature_Flags" },
+  adminUsers: { id: localEnv.APPWRITE_ADMIN_USERS_COLLECTION_ID || "admin_users", name: "Admin_Users" },
 };
 
 if (!endpoint || !projectId || !apiKey) {
@@ -185,16 +186,30 @@ async function setupFeatureFlags() {
   await ensureIndex(id, "feature_flag_key_unique", IndexType.Unique, ["key"]);
 }
 
+async function setupAdminUsers() {
+  const { id, name } = collections.adminUsers;
+  await ensureCollection(id, name);
+
+  await ensureStringAttribute(id, "userId", 64, true);
+  await ensureStringAttribute(id, "email", 128, true);
+  await ensureStringAttribute(id, "role", 32, true);
+
+  await waitForAttributes(id, ["userId", "email", "role"]);
+  await ensureIndex(id, "admin_user_id_unique", IndexType.Unique, ["userId"]);
+  await ensureIndex(id, "admin_email_unique", IndexType.Unique, ["email"]);
+}
+
 async function main() {
   console.log("GARAS Admin Appwrite setup starting...");
   await ensureDatabase();
   await setupAdminLogs();
   await setupSystemSettings();
   await setupFeatureFlags();
+  await setupAdminUsers();
 
   console.log("\nAdmin setup complete.");
   console.log(`Database: ${adminDatabaseId}`);
-  console.log(`Collections: ${collections.adminLogs.id}, ${collections.systemSettings.id}, ${collections.featureFlags.id}`);
+  console.log(`Collections: ${collections.adminLogs.id}, ${collections.systemSettings.id}, ${collections.featureFlags.id}, ${collections.adminUsers.id}`);
 }
 
 main().catch((error) => {

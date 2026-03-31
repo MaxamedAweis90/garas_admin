@@ -5,8 +5,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 type AccountResponse = { $id: string; email?: string; name?: string };
-type TeamListResponse = { teams: Array<{ $id: string; name: string }>; total: number };
-type MembershipListResponse = { memberships: Array<{ $id: string; userId: string; confirm?: boolean; joined?: string | null }>; total: number };
+type DocumentListResponse = { documents: Array<{ $id: string; userId: string; role: string }>; total: number };
 
 const FALLBACK_COOKIE_NAME = "garas_aw_cookie_fallback";
 const JWT_COOKIE_NAME = "garas_aw_jwt";
@@ -29,12 +28,12 @@ function normalizeEnv(value: string | undefined) {
   return (value ?? "").trim().replace(/^['\"]|['\"]$/g, "");
 }
 
-function getAdminTeamName() {
-  return normalizeEnv(process.env.ADMIN_TEAM_NAME) || "Admin";
+function getAdminDatabaseId() {
+  return normalizeEnv(process.env.APPWRITE_ADMIN_DATABASE_ID) || "garas_admin";
 }
 
-function getAdminTeamIdFromEnv() {
-  return normalizeEnv(process.env.ADMIN_TEAM_ID) || null;
+function getAdminUsersCollectionId() {
+  return normalizeEnv(process.env.APPWRITE_ADMIN_USERS_COLLECTION_ID) || "admin_users";
 }
 
 function getAdminEmails() {
@@ -141,60 +140,33 @@ async function appwriteApiKeyFetch<T>(path: string, init: RequestInit) {
   return { ok: true as const, status: res.status, data: (await res.json()) as T };
 }
 
-async function getAdminTeamId() {
-  const teamIdFromEnv = getAdminTeamIdFromEnv();
-  if (teamIdFromEnv) {
-    return { ok: true as const, id: teamIdFromEnv };
-  }
-
-  const adminTeamName = getAdminTeamName();
-  const teamsResult = await appwriteApiKeyFetch<TeamListResponse>(`/teams?search=${encodeURIComponent(adminTeamName)}`, {
-    method: "GET",
-  });
-
-  if (!teamsResult.ok) {
-    return { ok: false as const, status: teamsResult.status };
-  }
-
-  const team = teamsResult.data.teams.find((item) => item.name === adminTeamName) ?? null;
-  if (!team) {
-    return { ok: true as const, id: null as string | null };
-  }
-
-  return { ok: true as const, id: team.$id };
-}
-
-async function isAdminTeamMember(userId: string) {
-  const teamResult = await getAdminTeamId();
-  if (!teamResult.ok) {
-    return { ok: false as const, status: teamResult.status };
-  }
-
-  if (!teamResult.id) {
-    return { ok: true as const, isAdmin: false };
-  }
+async function isAdminUser(userId: string) {
+  const dbId = getAdminDatabaseId();
+  const colId = getAdminUsersCollectionId();
 
   const queries = [
     `equal("userId", ["${userId}"])`,
-    "limit(25)",
+    "limit(1)",
   ].map((q) => `queries[]=${encodeURIComponent(q)}`);
 
-  const memberships = await appwriteApiKeyFetch<MembershipListResponse>(`/teams/${teamResult.id}/memberships?${queries.join("&")}`, {
+  const records = await appwriteApiKeyFetch<DocumentListResponse>(`/databases/${dbId}/collections/${colId}/documents?${queries.join("&")}`, {
     method: "GET",
   });
 
-  if (!memberships.ok) {
-    return { ok: false as const, status: memberships.status };
+  if (!records.ok) {
+    // If collection doesn't exist, we might get 404. Let's just return false unless it's a 50x error.
+    if (records.status >= 500) {
+      return { ok: false as const, status: records.status };
+    }
+    return { ok: true as const, isAdmin: false, role: null };
   }
 
-  const isAdmin = memberships.data.memberships.some((membership) => {
-    if (membership.userId !== userId) {
-      return false;
-    }
-    return membership.confirm === true || Boolean(membership.joined);
-  });
+  const userDoc = records.data.documents[0];
+  if (!userDoc) {
+    return { ok: true as const, isAdmin: false, role: null };
+  }
 
-  return { ok: true as const, isAdmin };
+  return { ok: true as const, isAdmin: true, role: userDoc.role };
 }
 
 export async function GET() {
@@ -233,22 +205,29 @@ export async function GET() {
 
     const mainAdminEmail = normalizeEnv(process.env.MAIN_ADMIN_EMAIL);
     const email = result.data.email ?? "";
-    const isMainAdmin = Boolean(mainAdminEmail) && email.toLowerCase() === mainAdminEmail.toLowerCase();
     const isAllowedByEmail = isAdminEmail(email);
+    let isMainAdmin = Boolean(mainAdminEmail) && email.toLowerCase() === mainAdminEmail.toLowerCase();
 
-    let isAllowedByTeam = false;
-    if (!isAllowedByEmail) {
-      const membership = await isAdminTeamMember(result.data.$id);
-      if (!membership.ok) {
-        if (membership.status >= 500) {
-          return NextResponse.json({ error: "appwrite_unreachable" }, { status: 500 });
-        }
-        return NextResponse.json({ error: "forbidden" }, { status: 403 });
+    let isAllowedByDb = false;
+    let storedRole = null;
+    
+    const dbCheck = await isAdminUser(result.data.$id);
+    if (!dbCheck.ok) {
+      if (dbCheck.status >= 500) {
+        return NextResponse.json({ error: "appwrite_unreachable" }, { status: 500 });
       }
-      isAllowedByTeam = membership.isAdmin;
+      return NextResponse.json({ error: "forbidden" }, { status: 403 });
+    }
+    
+    isAllowedByDb = dbCheck.isAdmin;
+    storedRole = dbCheck.role;
+
+    // Upgrade to main admin if role is 'main_admin' in DB
+    if (storedRole === "main_admin") {
+      isMainAdmin = true;
     }
 
-    if (!isAllowedByEmail && !isAllowedByTeam) {
+    if (!isAllowedByEmail && !isAllowedByDb) {
       return NextResponse.json({ error: "forbidden" }, { status: 403 });
     }
 
@@ -257,6 +236,7 @@ export async function GET() {
       email: result.data.email ?? null,
       name: result.data.name ?? null,
       isMainAdmin,
+      role: storedRole || (isMainAdmin ? 'main_admin' : 'admin'),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

@@ -6,6 +6,7 @@ const COLLECTIONS = {
   adminLogs: { id: "admin_logs", name: "Admin_Logs" },
   systemSettings: { id: "system_settings", name: "System_Settings" },
   featureFlags: { id: "feature_flags", name: "Feature_Flags" },
+  adminUsers: { id: "admin_users", name: "Admin_Users" },
 } as const;
 
 async function withConflictGuard<T>(task: () => Promise<T>, ignoreCodes: number[] = [409, 400]) {
@@ -34,6 +35,9 @@ export async function ensureAdminStorage() {
   await withConflictGuard(() =>
     databases.createCollection(ADMIN_DATABASE_ID, COLLECTIONS.featureFlags.id, COLLECTIONS.featureFlags.name, [], true, true)
   );
+  await withConflictGuard(() =>
+    databases.createCollection(ADMIN_DATABASE_ID, COLLECTIONS.adminUsers.id, COLLECTIONS.adminUsers.name, [], true, true)
+  );
 
   // Minimal attributes for system settings and feature flags.
   await withConflictGuard(() =>
@@ -44,6 +48,17 @@ export async function ensureAdminStorage() {
   );
   await withConflictGuard(() =>
     databases.createBooleanAttribute(ADMIN_DATABASE_ID, COLLECTIONS.featureFlags.id, "enabled", true)
+  );
+  
+  // Attributes for admin users
+  await withConflictGuard(() =>
+    databases.createStringAttribute(ADMIN_DATABASE_ID, COLLECTIONS.adminUsers.id, "userId", 64, true)
+  );
+  await withConflictGuard(() =>
+    databases.createStringAttribute(ADMIN_DATABASE_ID, COLLECTIONS.adminUsers.id, "email", 128, true)
+  );
+  await withConflictGuard(() =>
+    databases.createStringAttribute(ADMIN_DATABASE_ID, COLLECTIONS.adminUsers.id, "role", 32, true)
   );
 
   // Ensure a single settings doc.

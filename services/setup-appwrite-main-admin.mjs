@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { AppwriteException, Client, ID, Query, Teams, Users } from "node-appwrite";
+import { AppwriteException, Client, ID, Query, Databases, Users } from "node-appwrite";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -72,18 +72,10 @@ if (!mainAdminEmail || !mainAdminPassword) {
 
 const client = new Client().setEndpoint(normalizeEndpoint(endpoint)).setProject(projectId).setKey(apiKey);
 const users = new Users(client);
-const teams = new Teams(client);
+const databases = new Databases(client);
 
-async function findOrCreateAdminTeamId() {
-  const result = await teams.list({ search: "Admin" });
-  const team = result.teams.find((t) => t.name === "Admin") ?? null;
-  if (team) {
-    return team.$id;
-  }
-
-  const created = await teams.create(ID.unique(), "Admin");
-  return created.$id;
-}
+const adminDatabaseId = localEnv.APPWRITE_ADMIN_DATABASE_ID || "garas_admin";
+const adminUsersCollectionId = localEnv.APPWRITE_ADMIN_USERS_COLLECTION_ID || "admin_users";
 
 async function findOrCreateUserIdByEmail(email) {
   const existing = await users.list([Query.equal("email", [email])]);
@@ -96,15 +88,27 @@ async function findOrCreateUserIdByEmail(email) {
   return created.$id;
 }
 
-async function ensureMembership(teamId, userId) {
+async function ensureAdminUserRecord(userId, email) {
   try {
-    // Using userId adds membership directly (no email confirmation flow).
-    await teams.createMembership(teamId, ["admin"], undefined, userId);
-    console.log("Added main admin to Admin team.");
-  } catch (error) {
-    if (error?.code === 409) {
-      console.log("Main admin is already a member of Admin team.");
+    const existing = await databases.listDocuments(adminDatabaseId, adminUsersCollectionId, [
+      Query.equal("userId", [userId])
+    ]);
+    
+    if (existing.documents.length > 0) {
+      console.log("Main admin is already in the admin_users collection.");
       return;
+    }
+
+    await databases.createDocument(adminDatabaseId, adminUsersCollectionId, ID.unique(), {
+      userId: userId,
+      email: email,
+      role: "main_admin"
+    });
+    console.log("Added main admin to admin_users collection.");
+  } catch (error) {
+    if (error?.code === 404) {
+      console.error("Collection 'admin_users' not found. Please run 'npm run setup:admin' first.");
+      throw error;
     }
     throw error;
   }
@@ -113,12 +117,10 @@ async function ensureMembership(teamId, userId) {
 async function main() {
   console.log("GARAS main admin setup starting...");
 
-  const teamId = await findOrCreateAdminTeamId();
   const userId = await findOrCreateUserIdByEmail(mainAdminEmail);
-  await ensureMembership(teamId, userId);
+  await ensureAdminUserRecord(userId, mainAdminEmail);
 
   console.log("\nMain admin setup complete.");
-  console.log(`Admin teamId: ${teamId}`);
   console.log(`Main admin userId: ${userId}`);
 }
 

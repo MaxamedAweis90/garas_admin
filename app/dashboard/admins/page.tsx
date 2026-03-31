@@ -4,14 +4,12 @@ import { AppwriteException } from "node-appwrite";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { getServerTeams } from "@/lib/appwrite/server";
+import { getServerDatabases, getServerUsers, ID, Query } from "@/lib/appwrite/server";
 
 export const dynamic = "force-dynamic";
 
-type TeamsListResponse = { teams: Array<{ $id: string; name: string }>; total: number };
-
 function normalizeEnv(value: string | undefined) {
-  return (value ?? "").trim().replace(/^['\"]|['\"]$/g, "");
+  return (value ?? "").trim().replace(/^['"]|['"]$/g, "");
 }
 
 function getAppwriteRestBase() {
@@ -51,30 +49,22 @@ async function getCurrentAccountEmail() {
   return data.email ?? null;
 }
 
-async function getRequestOrigin() {
-  // Works for localhost, Vercel, reverse proxies, etc.
-  // Prefer forwarded headers when present.
-  const h = await headers();
-  const forwardedProto = h.get("x-forwarded-proto");
-  const proto = forwardedProto || (process.env.NODE_ENV === "production" ? "https" : "http");
-
-  const forwardedHost = h.get("x-forwarded-host");
-  const host = forwardedHost || h.get("host") || "localhost:3000";
-
-  return `${proto}://${host}`;
-}
-
-async function getAdminTeamId() {
-  const teamsApi = getServerTeams();
-  const result = (await teamsApi.list({ search: "Admin" })) as unknown as TeamsListResponse;
-  const team = result.teams.find((item) => item.name === "Admin") ?? null;
-  return team?.$id ?? null;
-}
-
 export default async function AdminsPage() {
   const mainAdminEmail = normalizeEnv(process.env.MAIN_ADMIN_EMAIL) || "mohamedaweis.dev@gmail.com";
   const currentEmail = await getCurrentAccountEmail();
   const isMainAdmin = Boolean(currentEmail && currentEmail.toLowerCase() === mainAdminEmail.toLowerCase());
+
+  const databases = getServerDatabases();
+  let adminUsersList: any[] = [];
+  
+  if (isMainAdmin) {
+    try {
+      const res = await databases.listDocuments("garas_admin", "admin_users");
+      adminUsersList = res.documents;
+    } catch (error) {
+      console.warn("Could not fetch admin users, you might need to run the setup script.", error);
+    }
+  }
 
   async function invite(formData: FormData) {
     "use server";
@@ -90,16 +80,37 @@ export default async function AdminsPage() {
       throw new Error("Only the main admin can invite other admins.");
     }
 
-    const teamId = await getAdminTeamId();
-    if (!teamId) {
-      throw new Error('Appwrite Team "Admin" not found. Create it in Appwrite Console first.');
-    }
+    const usersApi = getServerUsers();
+    const dbApi = getServerDatabases();
 
-    const inviteUrl = normalizeEnv(process.env.ADMIN_INVITE_REDIRECT_URL) || `${await getRequestOrigin()}/login`;
-
-    const teamsApi = getServerTeams();
     try {
-      await teamsApi.createMembership(teamId, ["admin"], email, undefined, undefined, inviteUrl, "GARAS Admin");
+      // Find or create user
+      const usersRes = await usersApi.list([Query.equal("email", email)]);
+      let user = usersRes.users[0];
+
+      if (!user) {
+        const randomPassword = ID.unique() + ID.unique();
+        user = await usersApi.create(ID.unique(), email, undefined, randomPassword, "Admin User");
+      }
+
+      // Check if already in admin_users
+      const adminUsersRes = await dbApi.listDocuments("garas_admin", "admin_users", [
+        Query.equal("email", email)
+      ]);
+
+      if (adminUsersRes.total === 0) {
+        // Insert into admin_users collection
+        await dbApi.createDocument(
+          "garas_admin",
+          "admin_users",
+          ID.unique(),
+          {
+            userId: user.$id,
+            email: user.email,
+            role: "admin",
+          }
+        );
+      }
     } catch (error: any) {
       if (error instanceof AppwriteException) {
         throw new Error(error.message);
@@ -114,7 +125,7 @@ export default async function AdminsPage() {
     <div className="space-y-6">
       <header className="rounded-2xl border border-border bg-card p-5">
         <h1 className="text-lg font-semibold">Admins</h1>
-        <p className="mt-1 text-sm text-muted-foreground">Only the main admin can invite other admins.</p>
+        <p className="mt-1 text-sm text-muted-foreground">Only the main admin can manage other admins.</p>
       </header>
 
       {!isMainAdmin ? (
@@ -122,17 +133,35 @@ export default async function AdminsPage() {
           <p className="text-sm text-muted-foreground">Access denied. Sign in as the main admin to manage admins.</p>
         </section>
       ) : (
-        <section className="rounded-2xl border border-border bg-card p-5">
-          <form action={invite} className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="email">Invite admin by email</Label>
-              <Input id="email" name="email" type="email" placeholder="new-admin@example.com" required />
-              <p className="text-xs text-muted-foreground">This sends an Appwrite team invitation to the email.</p>
-            </div>
+        <div className="space-y-6">
+          <section className="rounded-2xl border border-border bg-card p-5">
+            <form action={invite} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="email">Invite admin by email</Label>
+                <Input id="email" name="email" type="email" placeholder="new-admin@example.com" required />
+                <p className="text-xs text-muted-foreground">This creates the user if they don't exist and grants them admin access.</p>
+              </div>
 
-            <Button type="submit" className="h-10">Send invite</Button>
-          </form>
-        </section>
+              <Button type="submit" className="h-10">Grant admin access</Button>
+            </form>
+          </section>
+
+          <section className="rounded-2xl border border-border bg-card p-5">
+            <h2 className="text-base font-semibold mb-4">Current Admins</h2>
+            {adminUsersList.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No admin users found.</p>
+            ) : (
+              <div className="space-y-2">
+                {adminUsersList.map((adminDoc) => (
+                  <div key={adminDoc.$id} className="flex flex-col p-3 rounded-md bg-muted/50 border border-border/50">
+                    <span className="font-medium">{adminDoc.email}</span>
+                    <span className="text-xs text-muted-foreground">Role: {adminDoc.role} | ID: {adminDoc.userId}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
       )}
     </div>
   );
